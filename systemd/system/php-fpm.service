@@ -1,0 +1,12 @@
+[Unit]
+Description=PHP FastCGI Process Manager
+After=syslog.target
+
+[Service]
+ExecStart=/usr/sbin/php-fpm
+ExecReload=/sbin/killproc -USR2 /usr/sbin/php-fpm
+ExecStop=/sbin/killproc -QUIT /usr/sbin/php-fpm
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

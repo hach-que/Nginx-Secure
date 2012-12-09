@@ -1,0 +1,11 @@
+# This file determines what servers will be running.  Each of these servers runs under their
+# own user and group, which is wwwusr-<suffix> and wwwgrp-<suffix> respectively.
+
+# Port  Name                            User suffix                         Hosts
+38080   sample-passthrough.com          sample-passthrough.com              .sample-passthrough.com
+2001    sample-wordpress.com            sample-wordpress.com                .sample-wordpress.com
+2002    sample-simple.com               sample-simple.com                   .sample-simple.com
+2003    sample-remote-proxy.com         sample-remote-proxy.com             .sample-remote-proxy.com
+2004    sample-uwsgi.com                sample-uwsgi.com                    .sample-uwsgi.com
+2005    sample-advanced.com             sample-advanced.com                 .sample-advanced.com .other-domain.com .somewhere-else.com
+

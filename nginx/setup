@@ -1,0 +1,195 @@
+#!/usr/bin/env python
+
+import sys, os
+from pyparsing import Word, OneOrMore
+from subprocess import call as run
+from subprocess import check_output as runo
+lowers = "abcdefghijklmnopqrstuvwxyz"
+hostname = lowers + ".-*"
+numbers = "0123456789"
+
+class Server():
+    def __init__(self, port, name, user_suffix, hosts):
+        self.port = port
+        self.name = name
+        self.user_suffix = user_suffix
+        self.hosts = hosts
+
+    @staticmethod
+    def read(path):
+        servers = list()
+        syntax = Word(numbers) + Word(hostname) + Word(hostname) + OneOrMore(Word(hostname))
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if len(line) == 0 or line[0] == "#":
+                    continue
+                r = syntax.parseString(line)
+                servers.append(Server(int(r[0]), r[1], r[2], r[3:]))
+        return servers
+
+class PHPEnabled():
+    php_enabled_path = "/etc/nginx/php-enabled"
+    
+    @staticmethod
+    def has(name):
+         with open(PHPEnabled.php_enabled_path) as f:
+            for line in f:
+                line = line.strip()
+                if len(line) == 0 or line[0] == "#":
+                    continue
+                if name == line:
+                    return True
+         return False
+
+# Read servers.
+servers = Server.read("/etc/nginx/servers")
+
+# Remove existing files.
+run("rm /etc/systemd/system/nginx.service.wants/*.service >/dev/null 2>/dev/null", shell=True)
+run("rm /etc/nginx/proxies/* >/dev/null 2>/dev/null", shell=True)
+run("rm /etc/nginx/upstream/* >/dev/null 2>/dev/null", shell=True)
+
+# Set initial PHP-FPM configuration.
+php_fpm = open("/etc/nginx/upstream/php-fpm.conf", "w")
+php_fpm.write("""
+[global]
+pid = /run/php-fpm.pid
+error_log = syslog
+daemonize = no
+""")
+
+# Perform server generation.
+count = 1
+restart = list()
+for srv in servers:
+    passthrough = False
+    nginx_conf = "/etc/nginx/vhosts.d/" + srv.name + ".conf"
+    if not os.path.exists(nginx_conf):
+        print "setup: [warning] the configuration file " + nginx_conf + " is missing; defaulting to pass-through!"
+        passthrough = True
+    with open("/etc/nginx/proxies/" + srv.name + ".conf", "w") as f:
+        f.write("""
+# !! THIS FILE WAS AUTOMATICALLY GENERATED !!
+# Define the reverse proxy.
+server {
+    listen      *:80;
+    server_name """ + " ".join(srv.hosts) + """;
+
+    access_log  /var/log/nginx/proxy/access_log-""" + srv.name + """;
+    error_log   /var/log/nginx/proxy/error_log-""" + srv.name + """;
+
+    location / {
+        proxy_pass              http://localhost:""" + str(srv.port) + """;
+        proxy_next_upstream     error timeout invalid_header http_500 http_502 http_503 http_504;
+        proxy_redirect          off;
+        proxy_buffering         off;
+        proxy_set_header        Host            $host;
+        proxy_set_header        X-Real-IP       $remote_addr;
+        proxy_set_header        X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+""")
+    # Check if this is a pass-through server or not.
+    if not passthrough:
+        # Create main configuration file.
+        conf = ""
+        with open(nginx_conf) as f:
+            conf = f.read()
+        conf_result = "/etc/nginx/upstream/" + str(count).zfill(3) + "-" + srv.name + ".conf"
+        with open(conf_result, "w") as f:
+            f.write("""
+# !! THIS FILE WAS AUTOMATICALLY GENERATED !!
+# Define the upstream server.
+worker_processes            2;
+pid                         /run/nginx-""" + srv.name + """.pid;
+user                        wwwusr-""" + srv.user_suffix + """ wwwgrp-""" + srv.user_suffix + """;
+events {
+    worker_connections      1024;
+    use epoll;
+}
+
+# HTTP handling.
+http {
+    include                 ../mime.types;
+    default_type            application/octet-stream;
+    sendfile                on;
+    keepalive_timeout       65;
+    gzip                    on;
+
+    server {
+        listen      localhost:""" + str(srv.port) + """;
+        server_name """ + " ".join(srv.hosts) + """;
+
+        access_log  /var/log/nginx/access_log-""" + srv.name + """;
+        error_log   /var/log/nginx/error_log-""" + srv.name + """;
+
+        """ + conf + """
+    }
+}
+""")
+        # Create systemd service.
+        nginx_path = "/usr/sbin/nginx-" + srv.name
+        unconfined = ""
+        if not os.path.exists(nginx_path):
+            nginx_path = "/usr/sbin/nginx"
+            unconfined = " (unconfined!!)"
+        with open("/etc/systemd/system/nginx.service.wants/nginx-" + srv.name + ".service", "w") as f:
+            f.write("""
+[Unit]
+Description=""" + srv.name + """ (nginx)
+After=syslog.target network.target remote-fs.target nss-lookup.target
+
+[Service]
+Type=forking
+PIDFile=/run/nginx-""" + srv.name + """.pid
+ExecStartPre=""" + nginx_path + """ -t -c """ + conf_result + """
+ExecStart=""" + nginx_path + """ -c """ + conf_result + """
+ExecReload=/bin/kill -s HUP $MAINPID
+ExecStop=/bin/kill -s QUIT $MAINPID
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+""")
+        # Determine if we also need to add a PHP-FPM module.
+        has_php_pool = PHPEnabled.has(srv.name)
+        if has_php_pool:
+            php_fpm.write("""
+[""" + srv.name + """]
+user = wwwusr-""" + srv.user_suffix + """
+group = wwwgrp-""" + srv.user_suffix + """
+listen = /tmp/php-fpm-""" + srv.name + """.sock
+listen.owner = wwwusr-""" + srv.user_suffix + """
+listen.group = wwwgrp-""" + srv.user_suffix + """
+listen.mode = 0666
+pm = dynamic
+pm.max_children = 4
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 4
+""")
+        print "setup: created host " + srv.name + " on port " + str(srv.port) + unconfined
+        restart.append("nginx-" + srv.name)
+    else:
+        print "setup: created pass-through " + srv.name + " on port " + str(srv.port)
+    count += 1
+php_fpm.close()
+restart.append("php-fpm")
+
+# Reload systemctl configuration.
+run(["systemctl", "--system", "daemon-reload"])
+for i in restart:
+    status = runo(["systemctl", "show", "-p", "ActiveState", i + ".service"])
+    if status.count("=active") > 0:
+        if run(["systemctl", "reload", i + ".service"]) != 0:
+            print "setup: [error] service for " + i + " did not reload successfully."
+            sys.exit(1)
+    else:
+        if run(["systemctl", "start", i + ".service"]) != 0:
+            print "setup: [error] service for " + i + " did not start successfully."
+            sys.exit(1)
+
+# Perform configuration test.
+sys.exit(run(["nginx", "-t"]))
+
