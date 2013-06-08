@@ -5,9 +5,9 @@ After=syslog.target network.target remote-fs.target nss-lookup.target
 [Service]
 Type=forking
 PIDFile=/run/nginx.pid
-ExecStartPre=/etc/nginx/setup
+ExecStartPre=/usr/bin/chmod a+rwX -R /var/lib/nginx/tmp
 ExecStart=/usr/sbin/nginx
-ExecReload=/etc/nginx/setup && /bin/kill -s HUP $MAINPID
+ExecReload=/bin/kill -s HUP $MAINPID
 ExecStop=/bin/kill -s QUIT $MAINPID
 
 [Install]
