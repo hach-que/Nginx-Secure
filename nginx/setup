@@ -1,23 +1,30 @@
 #!/usr/bin/env python
 
 import sys, os
-from pyparsing import Word, OneOrMore
+from pyparsing import Word, OneOrMore, ZeroOrMore, CaselessLiteral, Or, delimitedList, Optional, LineEnd, printables
 from subprocess import call as run
 from subprocess import check_output as runo
 lowers = "abcdefghijklmnopqrstuvwxyz"
-hostname = lowers + ".-*"
+hostname = lowers + ".-*_"
 numbers = "0123456789"
 
 class Server():
-    def __init__(self, port, name, user_suffix, hosts):
+    def __init__(self, port, name, user_suffix, hosts, opts):
         self.port = port
         self.name = name
         self.user_suffix = user_suffix
         self.hosts = hosts
+        self.options = opts
 
     @staticmethod
     def read(path):
         servers = list()
+        keywords = [
+            "ssl",
+            "ssl_only",
+            "lockdown",
+            "server_port_patch"
+        ];
         syntax = Word(numbers) + Word(hostname) + Word(hostname) + OneOrMore(Word(hostname))
         with open(path) as f:
             for line in f:
@@ -25,7 +32,15 @@ class Server():
                 if len(line) == 0 or line[0] == "#":
                     continue
                 r = syntax.parseString(line)
-                servers.append(Server(int(r[0]), r[1], r[2], r[3:]))
+                opts = []
+                i = 2
+                for s in r[3:]:
+                    i += 1
+                    if s in keywords:
+                        r.pop(i)
+                        i -= 1
+                        opts.append(s)
+                servers.append(Server(int(r[0]), r[1], r[2], r[3:], opts))
         return servers
 
 class PHPEnabled():
@@ -69,12 +84,49 @@ for srv in servers:
         print "setup: [warning] the configuration file " + nginx_conf + " is missing; defaulting to pass-through!"
         passthrough = True
     with open("/etc/nginx/proxies/" + srv.name + ".conf", "w") as f:
+        listen = """
+    listen      80;
+"""
+        lockdown = ""
+        server_port_patch = ""
+        if "ssl" in srv.options:
+            listen = """
+    listen      80;
+    listen      443 ssl;
+    ssl_certificate /etc/apache2/ssl.crt/https-""" + srv.name + """-cert.pem;
+    ssl_certificate_key /etc/apache2/ssl.key/https-""" + srv.name + """-key.pem;
+"""
+        elif "ssl_only" in srv.options:
+            listen = """
+    listen      443 ssl;
+    ssl_certificate /etc/apache2/ssl.crt/https-""" + srv.name + """-cert.pem;
+    ssl_certificate_key /etc/apache2/ssl.key/https-""" + srv.name + """-key.pem;
+"""
+        elif "lockdown" in srv.options:
+            listen = """
+    listen      8000 ssl;
+    ssl_certificate /etc/apache2/ssl.crt/https-""" + srv.name + """-cert.pem;
+    ssl_certificate_key /etc/apache2/ssl.key/https-""" + srv.name + """-key.pem;
+"""
+            lockdown = """
+    satisfy all;
+    allow 118.209.142.147;
+    allow 2001:44b8:416b:6401:3285:a9ff:fea3:5d09;
+    allow 59.167.198.201;
+    deny all;
+    auth_basic "Restricted Access";
+    auth_basic_user_file /srv/access/admin.users;
+"""
+        if "server_port_patch" in srv.options:
+            server_port_patch = ":$server_port"
+
         f.write("""
 # !! THIS FILE WAS AUTOMATICALLY GENERATED !!
 # Define the reverse proxy.
 server {
-    listen      *:80;
     server_name """ + " ".join(srv.hosts) + """;
+""" + listen + """
+""" + lockdown + """
 
     access_log  /var/log/nginx/proxy/access_log-""" + srv.name + """;
     error_log   /var/log/nginx/proxy/error_log-""" + srv.name + """;
@@ -84,9 +136,10 @@ server {
         proxy_next_upstream     error timeout invalid_header http_500 http_502 http_503 http_504;
         proxy_redirect          off;
         proxy_buffering         off;
-        proxy_set_header        Host            $host;
-        proxy_set_header        X-Real-IP       $remote_addr;
-        proxy_set_header        X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header        Host                 $host""" + server_port_patch + """;
+        proxy_set_header        X-Real-IP            $remote_addr;
+        proxy_set_header        X-Forwarded-For      $proxy_add_x_forwarded_for;
+        proxy_set_header        X-Forwarded-Proto    $scheme;
     }
 }
 """)
@@ -116,6 +169,8 @@ http {
     sendfile                on;
     keepalive_timeout       65;
     gzip                    on;
+    client_max_body_size    20M;
+    client_body_buffer_size 128k;
 
     server {
         listen      localhost:""" + str(srv.port) + """;
@@ -148,6 +203,7 @@ ExecStart=""" + nginx_path + """ -c """ + conf_result + """
 ExecReload=/bin/kill -s HUP $MAINPID
 ExecStop=/bin/kill -s QUIT $MAINPID
 Restart=always
+# User and Group is specified in Nginx configuration..
 
 [Install]
 WantedBy=multi-user.target
@@ -168,6 +224,8 @@ pm.max_children = 4
 pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 4
+php_value[newrelic.appname] = """ + "\"" + srv.name + "\"" + """
+php_value[magic_quotes_gpc] = Off
 """)
         print "setup: created host " + srv.name + " on port " + str(srv.port) + unconfined
         restart.append("nginx-" + srv.name)
